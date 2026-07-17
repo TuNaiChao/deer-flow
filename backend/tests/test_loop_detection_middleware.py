@@ -1238,3 +1238,75 @@ class TestFromConfig:
         result = mw._apply(_make_state(tool_calls=[_bash_call(f"cmd_{hard}")]), runtime)
         assert result is not None
         assert mw.consume_stop_reason("test-run") == "loop_capped"
+
+
+class TestLoopDetectionAuditEvent:
+    """LoopDetectionMiddleware records a ``middleware:loop_detection`` event
+    (issue #4243) so a loop fire is observable in run_events — not only via
+    the ``loop_capped`` stop reason and transient injected warnings.
+    """
+
+    def _runtime_with_journal(self, journal, thread_id="t-loop", run_id="r-loop"):
+        runtime = MagicMock()
+        runtime.context = {"thread_id": thread_id, "run_id": run_id, "__run_journal": journal}
+        return runtime
+
+    @staticmethod
+    def _state_with_repeated_tool(name="repeated_tool"):
+        return {"messages": [AIMessage(content="", tool_calls=[{"name": name, "args": {"x": 1}, "id": "c1"}])]}
+
+    def test_records_warn_event(self):
+        journal = MagicMock()
+        mw = LoopDetectionMiddleware(warn_threshold=3, hard_limit=5)
+        state = self._state_with_repeated_tool()
+        runtime = self._runtime_with_journal(journal)
+        # Calls 1-2: below warn threshold (no event). Call 3: warn fires.
+        for _ in range(3):
+            mw._apply(state, runtime)
+        warn_calls = [c for c in journal.record_middleware.call_args_list if c.kwargs.get("tag") == "loop_detection" and c.kwargs.get("action") == "warn"]
+        assert len(warn_calls) == 1
+        changes = warn_calls[0].kwargs["changes"]
+        assert changes["tools"] == ["repeated_tool"]
+        assert changes["warning"]  # non-empty framework warning text
+
+    def test_records_cap_event(self):
+        journal = MagicMock()
+        mw = LoopDetectionMiddleware(warn_threshold=3, hard_limit=5)
+        state = self._state_with_repeated_tool()
+        runtime = self._runtime_with_journal(journal)
+        results = [mw._apply(state, runtime) for _ in range(5)]
+        cap_calls = [c for c in journal.record_middleware.call_args_list if c.kwargs.get("tag") == "loop_detection" and c.kwargs.get("action") == "cap"]
+        assert len(cap_calls) == 1
+        # The cap turn returns a stripped AIMessage (tool_calls cleared).
+        assert results[-1] is not None
+        assert results[-1]["messages"][0].tool_calls == []
+
+    def test_no_event_when_no_loop(self):
+        journal = MagicMock()
+        mw = LoopDetectionMiddleware(warn_threshold=3, hard_limit=5)
+        state = self._state_with_repeated_tool()
+        runtime = self._runtime_with_journal(journal)
+        mw._apply(state, runtime)  # count=1
+        mw._apply(state, runtime)  # count=2
+        journal.record_middleware.assert_not_called()
+
+    def test_no_journal_in_runtime_context_is_silently_skipped(self):
+        mw = LoopDetectionMiddleware(warn_threshold=3, hard_limit=5)
+        state = self._state_with_repeated_tool()
+        runtime = MagicMock()
+        runtime.context = {"thread_id": "t-noj", "run_id": "r-noj"}  # no __run_journal
+        for _ in range(3):  # would warn on the 3rd call
+            mw._apply(state, runtime)  # must not raise
+
+    def test_journal_record_exception_does_not_break_run(self):
+        journal = MagicMock()
+        journal.record_middleware.side_effect = RuntimeError("db down")
+        mw = LoopDetectionMiddleware(warn_threshold=3, hard_limit=5)
+        state = self._state_with_repeated_tool()
+        runtime = self._runtime_with_journal(journal)
+        for _ in range(2):
+            mw._apply(state, runtime)
+        # 3rd call triggers a warn → journal raises inside _record_loop_event;
+        # _apply must swallow it and still queue the warning (returns None).
+        result = mw._apply(state, runtime)
+        assert result is None

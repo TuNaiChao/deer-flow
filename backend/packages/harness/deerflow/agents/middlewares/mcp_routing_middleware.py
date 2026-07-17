@@ -101,7 +101,7 @@ class McpRoutingMiddleware(AgentMiddleware[AgentState]):
         matched.sort(key=lambda item: (-item[0], item[1]))
         return [name for _, name in matched[: self._top_k]]
 
-    def _state_update(self, state: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    def _state_update(self, state: Mapping[str, Any] | None, runtime: Runtime) -> dict[str, Any] | None:
         names = self._matched_names(state)
         if not names:
             return None
@@ -111,6 +111,19 @@ class McpRoutingMiddleware(AgentMiddleware[AgentState]):
             (self._catalog_hash or "")[:8],
             names,
         )
+        # Emit the audit event only when routing surfaces a name not already
+        # promoted in this run. ``before_model`` fires on every model
+        # invocation, but the latest real HumanMessage — and therefore the
+        # match set — is stable within a run, so without this guard an
+        # identical ``deferred_tool:promoted`` row would be logged on every
+        # model call. Mirrors SkillActivationMiddleware's once-per-run guard;
+        # the state write itself is dedup'd by the ``merge_promoted`` reducer.
+        already_promoted: set[str] = set()
+        prior = (state or {}).get("promoted")
+        if isinstance(prior, dict) and prior.get("catalog_hash") == self._catalog_hash:
+            already_promoted = set(prior.get("names") or [])
+        if any(name not in already_promoted for name in names):
+            self._record_promotion_event(runtime, names)
         return {
             "promoted": {
                 "catalog_hash": self._catalog_hash,
@@ -118,13 +131,45 @@ class McpRoutingMiddleware(AgentMiddleware[AgentState]):
             }
         }
 
+    def _record_promotion_event(self, runtime: Runtime, names: list[str]) -> None:
+        """Persist a ``middleware:deferred_tool`` (action=promoted) record.
+
+        Auto-promotion is otherwise invisible outside the model-binding state
+        this middleware mutates; this event lets a consumer answer "which
+        deferred MCP tools did routing auto-promote this turn?" (see issue
+        #4243). Mirrors the safety-termination audit pattern: the run-scoped
+        ``RunJournal`` is reached via ``runtime.context["__run_journal"]``;
+        absent in unit-test / subagent / no-event-store paths, in which case
+        we silently skip. Manual promotion via the ``tool_search`` tool is a
+        separate code path and is intentionally not recorded here — follow-up.
+        """
+        context = getattr(runtime, "context", None) if runtime is not None else None
+        journal = context.get("__run_journal") if isinstance(context, dict) else None
+        if journal is None:
+            return
+        try:
+            journal.record_middleware(
+                tag="deferred_tool",
+                name=type(self).__name__,
+                hook="before_model",
+                action="promoted",
+                changes={
+                    "tools": list(names),
+                    "count": len(names),
+                    "catalog_hash": (self._catalog_hash or "")[:8],
+                },
+            )
+        except Exception:  # noqa: BLE001
+            # Audit-event persistence must never break agent execution.
+            logger.debug("Failed to record middleware:deferred_tool event", exc_info=True)
+
     @override
     def before_model(self, state: AgentState, runtime: Runtime) -> dict[str, Any] | None:
-        return self._state_update(state)
+        return self._state_update(state, runtime)
 
     @override
     async def abefore_model(self, state: AgentState, runtime: Runtime) -> dict[str, Any] | None:
-        return self._state_update(state)
+        return self._state_update(state, runtime)
 
 
 def assert_mcp_routing_before_deferred_filter(middlewares: Sequence[AgentMiddleware]) -> None:

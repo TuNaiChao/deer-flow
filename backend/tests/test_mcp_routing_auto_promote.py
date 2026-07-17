@@ -1,6 +1,7 @@
 """Tests for PR2 MCP routing auto-promotion."""
 
 import asyncio
+from unittest.mock import MagicMock
 
 import pytest
 from langchain.agents import create_agent
@@ -294,3 +295,95 @@ def test_privacy_no_trace_metadata_or_info_logs(caplog):
     assert state["metadata"] == {"trace": "existing"}
     assert "sensitive-keyword" not in caplog.text
     assert "secret_tool" not in caplog.text
+
+
+class TestRoutingPromotionAuditEvent:
+    """McpRoutingMiddleware records a ``middleware:deferred_tool`` (promoted)
+    event (issue #4243) so auto-promotion is observable in run_events.
+    """
+
+    @staticmethod
+    def _runtime_with_journal(journal):
+        runtime = MagicMock()
+        runtime.context = {"thread_id": "t-route", "__run_journal": journal}
+        return runtime
+
+    @staticmethod
+    def _middleware():
+        return McpRoutingMiddleware(
+            routing_index={"postgres_query": {"priority": 10, "keywords": ["orders"]}},
+            catalog_hash="abc12345",
+            top_k=3,
+        )
+
+    def test_records_promoted_event(self):
+        journal = MagicMock()
+        mw = self._middleware()
+        state = {"messages": [HumanMessage(content="show me the ORDERS table")]}
+        result = mw.before_model(state, self._runtime_with_journal(journal))
+        assert result == {"promoted": {"catalog_hash": "abc12345", "names": ["postgres_query"]}}
+
+        journal.record_middleware.assert_called_once()
+        call = journal.record_middleware.call_args
+        assert call.kwargs["tag"] == "deferred_tool"
+        assert call.kwargs["name"] == "McpRoutingMiddleware"
+        assert call.kwargs["hook"] == "before_model"
+        assert call.kwargs["action"] == "promoted"
+        changes = call.kwargs["changes"]
+        assert changes["tools"] == ["postgres_query"]
+        assert changes["count"] == 1
+        assert changes["catalog_hash"] == "abc12345"
+
+    def test_no_event_when_no_match(self):
+        journal = MagicMock()
+        mw = self._middleware()
+        state = {"messages": [HumanMessage(content="hello world, nothing to route")]}
+        assert mw.before_model(state, self._runtime_with_journal(journal)) is None
+        journal.record_middleware.assert_not_called()
+
+    def test_no_journal_is_silently_skipped(self):
+        mw = self._middleware()
+        state = {"messages": [HumanMessage(content="show ORDERS")]}
+        runtime = MagicMock()
+        runtime.context = {"thread_id": "t-noj"}  # no __run_journal
+        # Still promotes; only the event is skipped.
+        result = mw.before_model(state, runtime)
+        assert result is not None
+        assert result["promoted"]["names"] == ["postgres_query"]
+
+    def test_runtime_none_does_not_break(self):
+        """An existing call site passes runtime=None; promotion must still
+        return and the (absent) event path must skip cleanly."""
+        mw = self._middleware()
+        state = {"messages": [HumanMessage(content="show ORDERS")]}
+        result = mw.before_model(state, runtime=None)
+        assert result == {"promoted": {"catalog_hash": "abc12345", "names": ["postgres_query"]}}
+
+    def test_promotion_event_fires_once_per_run_not_per_model_call(self):
+        """``before_model`` fires on every model invocation in the agent loop,
+        but the match set is stable within a run (same latest HumanMessage).
+        The audit event must fire once per logical promotion, not once per
+        model call — mirrors SkillActivationMiddleware's once-per-run guard.
+        Regression for the duplicate-emission bug (issue #4243): without the
+        dedup guard this asserts 4 events instead of 1."""
+        journal = MagicMock()
+        mw = self._middleware()
+        runtime = self._runtime_with_journal(journal)
+        # Carry the promoted state forward across calls the way the
+        # merge_promoted reducer would apply each before_model update before
+        # the next model invocation sees it.
+        state: dict = {"messages": [HumanMessage(content="show ORDERS")]}
+        updates = []
+        for _ in range(4):  # four model calls in one run
+            update = mw.before_model(state, runtime)
+            updates.append(update)
+            promoted_names = (update or {}).get("promoted", {}).get("names") or []
+            if promoted_names:
+                state = dict(state)
+                state["promoted"] = {"catalog_hash": "abc12345", "names": list(promoted_names)}
+        # State is re-confirmed on every model call (idempotent writes; the
+        # merge_promoted reducer dedups state)...
+        assert all(u is not None and u.get("promoted", {}).get("names") for u in updates)
+        # ...but the audit event fires exactly once per run, not per model call.
+        promoted_calls = [c for c in journal.record_middleware.call_args_list if c.kwargs.get("tag") == "deferred_tool" and c.kwargs.get("action") == "promoted"]
+        assert len(promoted_calls) == 1, "promotion event must fire once per run, not per model call"

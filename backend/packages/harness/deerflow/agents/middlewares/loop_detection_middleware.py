@@ -605,6 +605,7 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
             last_msg = messages[-1]
             content = self._append_text(last_msg.content, warning or _HARD_STOP_MSG)
             stripped_msg = last_msg.model_copy(update=self._build_hard_stop_update(last_msg, content))
+            self._record_loop_event(runtime, "cap", state, warning)
             return {"messages": [stripped_msg]}
 
         if warning:
@@ -616,9 +617,53 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
             # tools node has not produced ToolMessage responses yet). The
             # warning is delivered via ``wrap_model_call`` below.
             self._queue_pending_warning(runtime, warning)
+            self._record_loop_event(runtime, "warn", state, warning)
             return None
 
         return None
+
+    def _record_loop_event(
+        self,
+        runtime: Runtime,
+        action: str,
+        state: AgentState,
+        warning: str | None,
+    ) -> None:
+        """Persist a ``middleware:loop_detection`` record to RunEventStore.
+
+        Loop detection is otherwise observable only through the ``loop_capped``
+        stop reason (and transient warnings injected at the next model call);
+        this event lets a consumer answer "did loop detection fire on this run,
+        and as a warn or a cap?" without parsing stop reasons or message text
+        (see issue #4243). Mirrors the safety-termination audit pattern: the
+        run-scoped ``RunJournal`` is reached via
+        ``runtime.context["__run_journal"]``; absent in unit-test / subagent /
+        no-event-store paths, in which case we silently skip.
+        """
+        context = getattr(runtime, "context", None) if runtime is not None else None
+        journal = context.get("__run_journal") if isinstance(context, dict) else None
+        if journal is None:
+            return
+        tool_names: list[str] = []
+        messages = state.get("messages", []) if isinstance(state, dict) else []
+        if messages:
+            last_msg = messages[-1]
+            calls = getattr(last_msg, "tool_calls", None) or []
+            tool_names = [str(tc.get("name", "")) for tc in calls if isinstance(tc, dict)]
+        try:
+            journal.record_middleware(
+                tag="loop_detection",
+                name=type(self).__name__,
+                hook="after_model",
+                action=action,
+                changes={
+                    "tools": tool_names,
+                    "warning": warning,
+                },
+            )
+        except Exception:  # noqa: BLE001
+            # Audit-event persistence must never break agent execution.
+            logger.debug("Failed to record middleware:loop_detection event", exc_info=True)
 
     def _clear_other_run_pending_warnings(self, runtime: Runtime) -> None:
         """Drop stale pending warnings for previous runs in this thread."""
